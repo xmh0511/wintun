@@ -65,6 +65,7 @@ pub(crate) struct UnsafeHandle<T>(pub T);
 unsafe impl<T> Send for UnsafeHandle<T> {}
 unsafe impl<T> Sync for UnsafeHandle<T> {}
 
+#[allow(dead_code)]
 pub(crate) fn guid_to_win_style_string(guid: &GUID) -> Result<String, Error> {
     let mut buffer = [0u16; 40];
     unsafe { StringFromGUID2(guid, &mut buffer as *mut u16, buffer.len() as i32) };

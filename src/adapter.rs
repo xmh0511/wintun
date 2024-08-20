@@ -7,7 +7,8 @@ use crate::{
     error::{Error, OutOfRangeData},
     session,
     util::{self, UnsafeHandle},
-    wintun_raw, Wintun,
+    wintun_raw::{self, WCHAR},
+    Wintun,
 };
 use std::{
     ffi::OsStr,
@@ -23,10 +24,13 @@ use windows_sys::{
     Win32::{
         Foundation::FALSE,
         NetworkManagement::{
-            IpHelper::{ConvertLengthToIpv4Mask, IP_ADAPTER_ADDRESSES_LH},
+            IpHelper::{
+                ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToAlias, ConvertInterfaceLuidToGuid,
+                ConvertInterfaceLuidToIndex, ConvertLengthToIpv4Mask,
+            },
             Ndis::NET_LUID_LH,
         },
-        System::{Com::CLSIDFromString, Threading::CreateEventA},
+        System::Threading::CreateEventA,
     },
 };
 
@@ -34,20 +38,66 @@ use windows_sys::{
 pub struct Adapter {
     adapter: UnsafeHandle<wintun_raw::WINTUN_ADAPTER_HANDLE>,
     wintun: Wintun,
-    guid: u128,
+    luid: NET_LUID_LH,
 }
 
-fn get_adapter_luid(wintun: &Wintun, adapter: wintun_raw::WINTUN_ADAPTER_HANDLE) -> NET_LUID_LH {
-    let mut luid: wintun_raw::NET_LUID = unsafe { std::mem::zeroed() };
-    unsafe { wintun.WintunGetAdapterLUID(adapter, &mut luid as *mut wintun_raw::NET_LUID) };
-    unsafe { std::mem::transmute(luid) }
+// fn get_adapter_luid(wintun: &Wintun, adapter: wintun_raw::WINTUN_ADAPTER_HANDLE) -> NET_LUID_LH {
+//     let mut luid: wintun_raw::NET_LUID = unsafe { std::mem::zeroed() };
+//     unsafe { wintun.WintunGetAdapterLUID(adapter, &mut luid as *mut wintun_raw::NET_LUID) };
+//     unsafe { std::mem::transmute(luid) }
+// }
+
+fn alias_to_luid(alias: &[WCHAR]) -> std::io::Result<NET_LUID_LH> {
+    let mut luid: NET_LUID_LH = unsafe { std::mem::zeroed() };
+
+    match unsafe { ConvertInterfaceAliasToLuid(alias.as_ptr(), &mut luid) } {
+        0 => Ok(luid),
+        err => Err(std::io::Error::from_raw_os_error(err as _)),
+    }
+}
+
+fn luid_to_index(luid: &NET_LUID_LH) -> std::io::Result<u32> {
+    let mut index = 0;
+
+    match unsafe { ConvertInterfaceLuidToIndex(luid, &mut index) } {
+        0 => Ok(index),
+        err => Err(std::io::Error::from_raw_os_error(err as _)),
+    }
+}
+
+fn luid_to_guid(luid: &NET_LUID_LH) -> std::io::Result<GUID> {
+    let mut guid = unsafe { std::mem::zeroed() };
+
+    match unsafe { ConvertInterfaceLuidToGuid(luid, &mut guid) } {
+        0 => Ok(guid),
+        err => Err(std::io::Error::from_raw_os_error(err as _)),
+    }
+}
+
+fn luid_to_alias(luid: &NET_LUID_LH) -> std::io::Result<Vec<WCHAR>> {
+    // IF_MAX_STRING_SIZE + 1
+    let mut alias = vec![0; 257];
+
+    match unsafe { ConvertInterfaceLuidToAlias(luid, alias.as_mut_ptr(), alias.len()) } {
+        0 => Ok(alias),
+        err => Err(std::io::Error::from_raw_os_error(err as _)),
+    }
+}
+
+fn luid_to_name_string(luid: &NET_LUID_LH) -> std::io::Result<String> {
+    let name = {
+        let mut name = luid_to_alias(&luid)?;
+        unsafe { util::win_pwstr_to_string(name.as_mut_ptr())? }
+    };
+    Ok(name)
 }
 
 impl Adapter {
     /// Returns the `Friendly Name` of this adapter,
     /// which is the human readable name shown in Windows
     pub fn get_name(&self) -> Result<String, Error> {
-        let name = util::guid_to_win_style_string(&GUID::from_u128(self.guid))?;
+        //let name = util::guid_to_win_style_string(&GUID::from_u128(self.guid))?;
+        let name = luid_to_name_string(&self.luid)?;
         let mut friendly_name = None;
 
         util::get_adapters_addresses(|address| {
@@ -80,7 +130,7 @@ impl Adapter {
     }
 
     pub fn get_guid(&self) -> u128 {
-        self.guid
+        util::win_guid_to_u128(&luid_to_guid(&self.luid).expect("Unable to find matching guid"))
     }
 
     /// Creates a new wintun adapter inside the name `name` with tunnel type `tunnel_type`
@@ -111,10 +161,11 @@ impl Adapter {
         if result.is_null() {
             Err("Failed to create adapter".into())
         } else {
+            let luid = alias_to_luid(&name_utf16)?;
             Ok(Arc::new(Adapter {
                 adapter: UnsafeHandle(result),
                 wintun: wintun.clone(),
-                guid,
+                luid,
             }))
         }
     }
@@ -137,24 +188,25 @@ impl Adapter {
         if result.is_null() {
             Err("WintunOpenAdapter failed".into())
         } else {
-            let mut guid = None;
-            util::get_adapters_addresses(|address: IP_ADAPTER_ADDRESSES_LH| {
-                let frindly_name = unsafe { util::win_pwstr_to_string(address.FriendlyName)? };
-                if frindly_name == name {
-                    let adapter_name = unsafe { util::win_pstr_to_string(address.AdapterName) }?;
-                    let adapter_name_utf16: Vec<u16> = adapter_name.encode_utf16().chain(std::iter::once(0)).collect();
-                    let adapter_name_ptr: *const u16 = adapter_name_utf16.as_ptr();
-                    let mut adapter: GUID = unsafe { std::mem::zeroed() };
-                    unsafe { CLSIDFromString(adapter_name_ptr, &mut adapter as *mut GUID) };
-                    guid = Some(adapter);
-                }
-                Ok(())
-            })?;
-            let guid = util::win_guid_to_u128(&guid.ok_or("Unable to find matching GUID")?);
+            // let mut guid = None;
+            // util::get_adapters_addresses(|address: IP_ADAPTER_ADDRESSES_LH| {
+            //     let frindly_name = unsafe { util::win_pwstr_to_string(address.FriendlyName)? };
+            //     if frindly_name == name {
+            //         let adapter_name = unsafe { util::win_pstr_to_string(address.AdapterName) }?;
+            //         let adapter_name_utf16: Vec<u16> = adapter_name.encode_utf16().chain(std::iter::once(0)).collect();
+            //         let adapter_name_ptr: *const u16 = adapter_name_utf16.as_ptr();
+            //         let mut adapter: GUID = unsafe { std::mem::zeroed() };
+            //         unsafe { CLSIDFromString(adapter_name_ptr, &mut adapter as *mut GUID) };
+            //         guid = Some(adapter);
+            //     }
+            //     Ok(())
+            // })?;
+            // let guid = util::win_guid_to_u128(&guid.ok_or("Unable to find matching GUID")?);
+            let luid = alias_to_luid(&name_utf16)?;
             Ok(Arc::new(Adapter {
                 adapter: UnsafeHandle(result),
                 wintun: wintun.clone(),
-                guid,
+                luid,
             }))
         }
     }
@@ -199,7 +251,8 @@ impl Adapter {
 
     /// Returns the Win32 LUID for this adapter
     pub fn get_luid(&self) -> NET_LUID_LH {
-        get_adapter_luid(&self.wintun, self.adapter.0)
+        //get_adapter_luid(&self.wintun, self.adapter.0)
+        self.luid
     }
 
     /// Set `MTU` of this adapter
@@ -217,18 +270,19 @@ impl Adapter {
     /// Returns the Win32 interface index of this adapter. Useful for specifying the interface
     /// when executing `netsh interface ip` commands
     pub fn get_adapter_index(&self) -> Result<u32, Error> {
-        let name = util::guid_to_win_style_string(&GUID::from_u128(self.guid))?;
-        let mut adapter_index = None;
+        luid_to_index(&self.luid).map_err(|e| e.into())
+        // let name = util::guid_to_win_style_string(&GUID::from_u128(self.guid))?;
+        // let mut adapter_index = None;
 
-        util::get_adapters_addresses(|address| {
-            let name_iter = unsafe { util::win_pstr_to_string(address.AdapterName) }?;
-            if name_iter == name {
-                adapter_index = unsafe { Some(address.Anonymous1.Anonymous.IfIndex) };
-                // adapter_index = Some(address.Ipv6IfIndex);
-            }
-            Ok(())
-        })?;
-        adapter_index.ok_or(format!("Unable to find matching {}", name).into())
+        // util::get_adapters_addresses(|address| {
+        //     let name_iter = unsafe { util::win_pstr_to_string(address.AdapterName) }?;
+        //     if name_iter == name {
+        //         adapter_index = unsafe { Some(address.Anonymous1.Anonymous.IfIndex) };
+        //         // adapter_index = Some(address.Ipv6IfIndex);
+        //     }
+        //     Ok(())
+        // })?;
+        // adapter_index.ok_or(format!("Unable to find matching {}", name).into())
     }
 
     /// Sets the IP address for this adapter, using command `netsh`.
@@ -322,8 +376,8 @@ impl Adapter {
 
     /// Returns the IP addresses of this adapter, including IPv4 and IPv6 addresses
     pub fn get_addresses(&self) -> Result<Vec<IpAddr>, Error> {
-        let name = util::guid_to_win_style_string(&GUID::from_u128(self.guid))?;
-
+        //let name = util::guid_to_win_style_string(&GUID::from_u128(self.guid))?;
+        let name = luid_to_name_string(&self.luid)?;
         let mut adapter_addresses = vec![];
 
         util::get_adapters_addresses(|adapter| {
@@ -351,7 +405,7 @@ impl Adapter {
 
     /// Returns the gateway addresses of this adapter, including IPv4 and IPv6 addresses
     pub fn get_gateways(&self) -> Result<Vec<IpAddr>, Error> {
-        let name = util::guid_to_win_style_string(&GUID::from_u128(self.guid))?;
+        let name = luid_to_name_string(&self.luid)?;
         let mut gateways = vec![];
         util::get_adapters_addresses(|adapter| {
             let name_iter = unsafe { util::win_pstr_to_string(adapter.AdapterName) }?;
@@ -377,7 +431,7 @@ impl Adapter {
 
     /// Returns the subnet mask of the given address
     pub fn get_netmask_of_address(&self, target_address: &IpAddr) -> Result<IpAddr, Error> {
-        let name = util::guid_to_win_style_string(&GUID::from_u128(self.guid))?;
+        let name = luid_to_name_string(&self.luid)?;
         let mut subnet_mask = None;
         util::get_adapters_addresses(|adapter| {
             let name_iter = unsafe { util::win_pstr_to_string(adapter.AdapterName) }?;

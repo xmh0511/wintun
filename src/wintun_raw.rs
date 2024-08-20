@@ -80,13 +80,13 @@ where
         }
     }
 }
-pub type wchar_t = ::std::os::raw::c_ushort;
+pub type WcharT = ::std::os::raw::c_ushort;
 pub type DWORD = ::std::os::raw::c_ulong;
 pub type BOOL = ::std::os::raw::c_int;
 pub type BYTE = ::std::os::raw::c_uchar;
 pub type ULONG64 = ::std::os::raw::c_ulonglong;
 pub type DWORD64 = ::std::os::raw::c_ulonglong;
-pub type WCHAR = wchar_t;
+pub type WCHAR = WcharT;
 pub type LPCWSTR = *const WCHAR;
 pub type HANDLE = *mut ::std::os::raw::c_void;
 #[repr(C)]
